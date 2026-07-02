@@ -655,6 +655,15 @@ ENV_RECALL_STRATEGY_BOOSTS = "HINDSIGHT_API_RECALL_STRATEGY_BOOSTS"
 ENV_RECENCY_DECAY_FUNCTION = "HINDSIGHT_API_RECENCY_DECAY_FUNCTION"
 ENV_RECENCY_DECAY_LINEAR_WINDOW_DAYS = "HINDSIGHT_API_RECENCY_DECAY_LINEAR_WINDOW_DAYS"
 ENV_RECENCY_DECAY_HALFLIFE_DAYS = "HINDSIGHT_API_RECENCY_DECAY_HALFLIFE_DAYS"
+# Which date anchors an observation's recency effective-date during recall
+# reranking. "occurred_start" (default) preserves the historical
+# occurred-start-first coalesce for every result. "mentioned_at" makes
+# observation-type results anchor to their freshest support: observations
+# aggregate occurred_start as the MINIMUM of their supporting facts (oldest
+# evidence) while mentioned_at is GREATEST-refreshed on every re-confirmation,
+# so mentioned-first anchoring keeps re-confirmed observations fresh and lets
+# long-unconfirmed ones decay. Non-observation results are unaffected.
+ENV_OBSERVATION_RECENCY_ANCHOR = "HINDSIGHT_API_OBSERVATION_RECENCY_ANCHOR"
 
 # Audit log settings
 ENV_AUDIT_LOG_ENABLED = "HINDSIGHT_API_AUDIT_LOG_ENABLED"
@@ -805,6 +814,10 @@ DEFAULT_RECENCY_DECAY_FUNCTION = "linear"
 DEFAULT_RECENCY_DECAY_LINEAR_WINDOW_DAYS = 365.0
 # Exponential: age (days) at which the recency signal is neutral (0.5).
 DEFAULT_RECENCY_DECAY_HALFLIFE_DAYS = 90.0
+# Recency effective-date anchoring for observation results (see
+# ENV_OBSERVATION_RECENCY_ANCHOR). "occurred_start" keeps behaviour unchanged.
+OBSERVATION_RECENCY_ANCHORS = ("occurred_start", "mentioned_at")
+DEFAULT_OBSERVATION_RECENCY_ANCHOR = "occurred_start"
 # Retrieval arms that can be boosted; mirrors fusion.py source_names.
 RECALL_STRATEGY_NAMES = ("semantic", "bm25", "graph", "temporal")
 # User-facing priority levels. Kept in sync with recall_boost.BOOST_LEVELS by a
@@ -1320,6 +1333,18 @@ def _validate_recency_decay_function(function: str) -> str:
     return function_lower
 
 
+def _validate_observation_recency_anchor(anchor: str) -> str:
+    """Validate and normalize the observation recency anchor."""
+    anchor_lower = anchor.lower()
+    if anchor_lower not in OBSERVATION_RECENCY_ANCHORS:
+        logger.warning(
+            f"Invalid observation recency anchor '{anchor}', must be one of {OBSERVATION_RECENCY_ANCHORS}. "
+            f"Defaulting to '{DEFAULT_OBSERVATION_RECENCY_ANCHOR}'."
+        )
+        return DEFAULT_OBSERVATION_RECENCY_ANCHOR
+    return anchor_lower
+
+
 def _parse_bank_priority(raw: str) -> dict[str, int]:
     """Parse ``bank-pattern:priority,...`` into ``{pattern: priority}``.
 
@@ -1715,6 +1740,7 @@ class HindsightConfig:
     recency_decay_function: str
     recency_decay_linear_window_days: float
     recency_decay_halflife_days: float
+    observation_recency_anchor: str
     reranker_cohere_api_key: str | None
     reranker_cohere_model: str
     reranker_cohere_base_url: str | None
@@ -2622,6 +2648,9 @@ class HindsightConfig:
             ),
             recency_decay_halflife_days=float(
                 os.getenv(ENV_RECENCY_DECAY_HALFLIFE_DAYS, str(DEFAULT_RECENCY_DECAY_HALFLIFE_DAYS))
+            ),
+            observation_recency_anchor=_validate_observation_recency_anchor(
+                os.getenv(ENV_OBSERVATION_RECENCY_ANCHOR, DEFAULT_OBSERVATION_RECENCY_ANCHOR)
             ),
             # Cohere reranker (with backward-compatible fallback to shared API key)
             reranker_cohere_api_key=os.getenv(ENV_RERANKER_COHERE_API_KEY) or os.getenv(ENV_COHERE_API_KEY),

@@ -5,7 +5,7 @@ Cross-encoder neural reranking for search results.
 import math
 from datetime import datetime, timezone
 
-from .types import MergedCandidate, ScoredResult
+from .types import MergedCandidate, RetrievalResult, ScoredResult
 
 UTC = timezone.utc
 
@@ -31,6 +31,40 @@ _PROOF_COUNT_ALPHA: float = 0.1  # Conservative: max ±5% for evidence strength
 _RECENCY_DECAY_FUNCTION: str = "linear"
 _RECENCY_DECAY_LINEAR_WINDOW_DAYS: float = 365.0
 _RECENCY_DECAY_HALFLIFE_DAYS: float = 90.0
+
+# Which date anchors an observation's recency effective-date.
+#
+#   "occurred_start" — the historical default: every result uses the
+#                      occurred_start → mentioned_at → occurred_end coalesce
+#                      (the same order as retrieval._coalesce_date).
+#   "mentioned_at"   — observation-type results anchor mentioned-at-first
+#                      (mentioned_at → occurred_start → occurred_end).
+#                      Observations aggregate occurred_start as the MINIMUM of
+#                      their supporting facts (oldest evidence) while
+#                      mentioned_at is GREATEST-refreshed on every
+#                      re-confirmation, so this anchors a compiled observation
+#                      to its freshest support: re-confirmed observations stay
+#                      fresh, long-unconfirmed ones decay naturally.
+# Non-observation results always keep the historical coalesce order.
+# The validated set of names lives in config.OBSERVATION_RECENCY_ANCHORS.
+_OBSERVATION_RECENCY_ANCHOR: str = "occurred_start"
+_OBSERVATION_FACT_TYPE: str = "observation"
+
+
+def effective_recency_date(
+    retrieval: RetrievalResult,
+    observation_recency_anchor: str = _OBSERVATION_RECENCY_ANCHOR,
+) -> datetime | None:
+    """The date that anchors a result's recency signal.
+
+    Observation results anchor mentioned-at-first when the configured anchor is
+    "mentioned_at"; every other result (and every result under the default
+    anchor) uses the historical occurred-start-first coalesce, matching
+    retrieval._coalesce_date.
+    """
+    if observation_recency_anchor == "mentioned_at" and retrieval.fact_type == _OBSERVATION_FACT_TYPE:
+        return retrieval.mentioned_at or retrieval.occurred_start or retrieval.occurred_end
+    return retrieval.occurred_start or retrieval.mentioned_at or retrieval.occurred_end
 
 
 def compute_recency_decay(
@@ -65,6 +99,7 @@ def apply_combined_scoring(
     recency_decay_function: str = _RECENCY_DECAY_FUNCTION,
     recency_decay_linear_window_days: float = _RECENCY_DECAY_LINEAR_WINDOW_DAYS,
     recency_decay_halflife_days: float = _RECENCY_DECAY_HALFLIFE_DAYS,
+    observation_recency_anchor: str = _OBSERVATION_RECENCY_ANCHOR,
 ) -> None:
     """Apply combined scoring to a list of ScoredResults in-place.
 
@@ -104,6 +139,10 @@ def apply_combined_scoring(
             decays to its floor (default 365).
         recency_decay_halflife_days: For the exponential curve, the age at which
             the recency signal is neutral (0.5) (default 90).
+        observation_recency_anchor: Which date anchors an observation's recency
+            effective-date — "occurred_start" (default, historical behavior) or
+            "mentioned_at" (anchor observations to their freshest support).
+            Non-observation results are unaffected. See effective_recency_date.
     """
     if now.tzinfo is None:
         now = now.replace(tzinfo=UTC)
@@ -151,9 +190,10 @@ def apply_combined_scoring(
         # occurred_end) — the same COALESCE order as retrieval._coalesce_date — so a
         # memory that carries only a mentioned_at / occurred_end (e.g. conversation
         # facts or ongoing states that intentionally lack occurred_start) still gets
-        # correct recency ordering instead of a flat neutral 0.5.
+        # correct recency ordering instead of a flat neutral 0.5. Observations may
+        # anchor mentioned-at-first instead — see effective_recency_date.
         sr.recency = 0.5
-        effective = sr.retrieval.occurred_start or sr.retrieval.mentioned_at or sr.retrieval.occurred_end
+        effective = effective_recency_date(sr.retrieval, observation_recency_anchor)
         if effective:
             occurred = effective
             if occurred.tzinfo is None:
@@ -247,13 +287,25 @@ class CrossEncoderReranker:
             ) from e
         self._initialized = True
 
-    async def rerank(self, query: str, candidates: list[MergedCandidate]) -> list[ScoredResult]:
+    async def rerank(
+        self,
+        query: str,
+        candidates: list[MergedCandidate],
+        observation_recency_anchor: str = _OBSERVATION_RECENCY_ANCHOR,
+    ) -> list[ScoredResult]:
         """
         Rerank candidates using cross-encoder scores.
 
         Args:
             query: Search query
             candidates: Merged candidates from RRF
+            observation_recency_anchor: Which date anchors an observation's
+                [Date: …] document prefix — "occurred_start" (default,
+                historical behavior) or "mentioned_at" (date observations by
+                their freshest support). Non-observation results always use
+                occurred_start. Keep in sync with the anchor passed to
+                apply_combined_scoring so the cross-encoder sees the same date
+                the recency boost scores against.
 
         Returns:
             List of ScoredResult objects sorted by cross-encoder score
@@ -271,16 +323,21 @@ class CrossEncoderReranker:
             if retrieval.context:
                 doc_text = f"{retrieval.context}: {doc_text}"
 
-            # Add formatted date information for temporal awareness
-            if retrieval.occurred_start:
-                occurred_start = retrieval.occurred_start
-
+            # Add formatted date information for temporal awareness.
+            # Observations under the "mentioned_at" anchor are dated by their
+            # freshest support (see effective_recency_date); everything else
+            # keeps the historical occurred_start-only prefix.
+            if retrieval.fact_type == _OBSERVATION_FACT_TYPE and observation_recency_anchor == "mentioned_at":
+                date_anchor = effective_recency_date(retrieval, observation_recency_anchor)
+            else:
+                date_anchor = retrieval.occurred_start
+            if date_anchor:
                 # Format in two styles for better model understanding
                 # 1. ISO format: YYYY-MM-DD
-                date_iso = occurred_start.strftime("%Y-%m-%d")
+                date_iso = date_anchor.strftime("%Y-%m-%d")
 
                 # 2. Human-readable: "June 5, 2022"
-                date_readable = occurred_start.strftime("%B %d, %Y")
+                date_readable = date_anchor.strftime("%B %d, %Y")
 
                 # Prepend date to document text
                 doc_text = f"[Date: {date_readable} ({date_iso})] {doc_text}"

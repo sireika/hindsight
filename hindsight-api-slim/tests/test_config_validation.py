@@ -27,6 +27,7 @@ def setup_test_env():
         "HINDSIGHT_API_LLM_BEDROCK_SERVICE_TIER",
         "HINDSIGHT_API_LLM_GEMINI_SERVICE_TIER",
         "HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY",
+        "HINDSIGHT_API_OBSERVATION_RECENCY_ANCHOR",
         "HINDSIGHT_API_DATABASE_URL",
         "HINDSIGHT_API_MIGRATION_DATABASE_URL",
     ]
@@ -174,6 +175,37 @@ def test_semantic_min_similarity_must_be_between_zero_and_one():
 
     with pytest.raises(ValueError, match="semantic_min_similarity"):
         HindsightConfig.from_env()
+
+
+def test_observation_recency_anchor_defaults_to_occurred_start():
+    """By default observation recency keeps the historical occurred-start anchoring."""
+    from hindsight_api.config import HindsightConfig
+
+    config = HindsightConfig.from_env()
+    assert config.observation_recency_anchor == "occurred_start"
+
+
+def test_observation_recency_anchor_reads_from_env():
+    """The observation recency anchor can be switched to mentioned_at."""
+    from hindsight_api.config import HindsightConfig
+
+    os.environ["HINDSIGHT_API_OBSERVATION_RECENCY_ANCHOR"] = "mentioned_at"
+
+    config = HindsightConfig.from_env()
+    assert config.observation_recency_anchor == "mentioned_at"
+
+
+def test_observation_recency_anchor_invalid_falls_back_to_default(caplog):
+    """An unknown anchor degrades to the default with a warning, not a crash."""
+    from hindsight_api.config import HindsightConfig
+
+    os.environ["HINDSIGHT_API_OBSERVATION_RECENCY_ANCHOR"] = "occurred_end"
+
+    with caplog.at_level(logging.WARNING):
+        config = HindsightConfig.from_env()
+
+    assert config.observation_recency_anchor == "occurred_start"
+    assert "Invalid observation recency anchor" in caplog.text
 
 
 def test_consolidation_max_completion_tokens_defaults_to_unset():

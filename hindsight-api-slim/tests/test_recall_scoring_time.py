@@ -24,7 +24,9 @@ class _Reranker:
     async def ensure_initialized(self) -> None:
         return None
 
-    async def rerank(self, _query: str, candidates: list[Any]) -> list[ScoredResult]:
+    async def rerank(
+        self, _query: str, candidates: list[Any], observation_recency_anchor: str = "occurred_start"
+    ) -> list[ScoredResult]:
         return [
             ScoredResult(
                 candidate=candidates[0],

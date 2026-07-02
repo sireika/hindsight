@@ -7,12 +7,15 @@ relevance score, independent of the cross-encoder model's score calibration.
 """
 
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock
 
 from hindsight_api.engine.search.reranking import (
     _RECENCY_ALPHA,
     _TEMPORAL_ALPHA,
+    CrossEncoderReranker,
     apply_combined_scoring,
     compute_recency_decay,
+    effective_recency_date,
 )
 from hindsight_api.engine.search.types import MergedCandidate, RetrievalResult, ScoredResult
 
@@ -26,11 +29,12 @@ def _make_result(
     temporal_proximity: float | None = None,
     mentioned_at: datetime | None = None,
     occurred_end: datetime | None = None,
+    fact_type: str = "world",
 ) -> ScoredResult:
     retrieval = RetrievalResult(
         id="test",
         text="test",
-        fact_type="world",
+        fact_type=fact_type,
         occurred_start=occurred_start,
         occurred_end=occurred_end,
         mentioned_at=mentioned_at,
@@ -252,3 +256,120 @@ class TestRecencyDecayFunction:
         apply_combined_scoring([sr], now=NOW, recency_decay_function="none")
         assert sr.recency == 0.5
         assert abs(sr.weight - 0.5) < 1e-9  # neutral → no recency boost
+
+
+class TestObservationRecencyAnchor:
+    """The configurable observation recency anchor (effective_recency_date).
+
+    Observations aggregate occurred_start = MIN(supports) — their oldest
+    evidence — while mentioned_at = MAX(supports) is refreshed on every
+    re-confirmation. Under anchor="mentioned_at", observation results derive
+    recency from their freshest support; everything else keeps the historical
+    occurred-start-first coalesce.
+    """
+
+    OLD = NOW - timedelta(days=400)
+    FRESH = NOW - timedelta(days=1)
+    END = NOW - timedelta(days=10)
+
+    # --- effective_recency_date -------------------------------------------
+
+    def test_default_anchor_is_occurred_start_first_for_observations(self):
+        """Default anchor preserves the historical order even for observations."""
+        retrieval = _make_result(
+            ce_norm=0.5, occurred_start=self.OLD, mentioned_at=self.FRESH, fact_type="observation"
+        ).retrieval
+        assert effective_recency_date(retrieval) == self.OLD
+
+    def test_mentioned_at_anchor_prefers_mentioned_at_for_observations(self):
+        retrieval = _make_result(
+            ce_norm=0.5, occurred_start=self.OLD, mentioned_at=self.FRESH, fact_type="observation"
+        ).retrieval
+        assert effective_recency_date(retrieval, "mentioned_at") == self.FRESH
+
+    def test_mentioned_at_anchor_falls_back_to_occurred_start(self):
+        """An observation without mentioned_at keeps its occurred_start date."""
+        retrieval = _make_result(ce_norm=0.5, occurred_start=self.OLD, fact_type="observation").retrieval
+        assert effective_recency_date(retrieval, "mentioned_at") == self.OLD
+
+    def test_mentioned_at_anchor_falls_back_to_occurred_end(self):
+        retrieval = _make_result(ce_norm=0.5, occurred_end=self.END, fact_type="observation").retrieval
+        assert effective_recency_date(retrieval, "mentioned_at") == self.END
+
+    def test_mentioned_at_anchor_leaves_non_observations_unchanged(self):
+        """Non-observation results keep occurred-start-first in every mode."""
+        retrieval = _make_result(ce_norm=0.5, occurred_start=self.OLD, mentioned_at=self.FRESH).retrieval
+        assert effective_recency_date(retrieval, "mentioned_at") == self.OLD
+
+    # --- threading through apply_combined_scoring -------------------------
+
+    def test_anchor_threads_through_apply_combined_scoring(self):
+        """A re-confirmed observation scores fresh under the mentioned_at anchor."""
+        sr = _make_result(ce_norm=0.5, occurred_start=self.OLD, mentioned_at=self.FRESH, fact_type="observation")
+        apply_combined_scoring([sr], now=NOW, observation_recency_anchor="mentioned_at")
+        assert sr.recency > 0.9
+
+    def test_default_scoring_penalises_old_evidence_observation(self):
+        """Without the anchor, the same observation stays pinned to its oldest support."""
+        sr = _make_result(ce_norm=0.5, occurred_start=self.OLD, mentioned_at=self.FRESH, fact_type="observation")
+        apply_combined_scoring([sr], now=NOW)
+        assert sr.recency == 0.1  # 400 days old → linear floor
+
+    def test_anchor_does_not_move_non_observations(self):
+        """The mentioned_at anchor must be a no-op for world/experience facts."""
+        sr_default = _make_result(ce_norm=0.5, occurred_start=self.OLD, mentioned_at=self.FRESH)
+        sr_anchored = _make_result(ce_norm=0.5, occurred_start=self.OLD, mentioned_at=self.FRESH)
+        apply_combined_scoring([sr_default], now=NOW)
+        apply_combined_scoring([sr_anchored], now=NOW, observation_recency_anchor="mentioned_at")
+        assert sr_anchored.recency == sr_default.recency
+        assert abs(sr_anchored.weight - sr_default.weight) < 1e-9
+
+    # --- the cross-encoder [Date: …] document prefix -----------------------
+
+    @staticmethod
+    def _make_reranker_and_candidate(fact_type: str, **dates) -> tuple[CrossEncoderReranker, MergedCandidate]:
+        retrieval = RetrievalResult(id="test", text="doc", fact_type=fact_type, **dates)
+        candidate = MergedCandidate(retrieval=retrieval, rrf_score=0.05)
+        ce = AsyncMock()
+        ce.predict = AsyncMock(return_value=[0.5])
+        ce.provider_name = "local"
+        return CrossEncoderReranker(cross_encoder=ce), candidate
+
+    @staticmethod
+    def _document_sent_to_cross_encoder(reranker: CrossEncoderReranker) -> str:
+        (pairs,) = reranker.cross_encoder.predict.call_args.args
+        return pairs[0][1]
+
+    async def test_date_prefix_default_uses_occurred_start_for_observations(self):
+        """Default anchor: the historical occurred_start-only prefix is preserved."""
+        reranker, candidate = self._make_reranker_and_candidate(
+            "observation", occurred_start=self.OLD, mentioned_at=self.FRESH
+        )
+        await reranker.rerank("query", [candidate])
+        doc = self._document_sent_to_cross_encoder(reranker)
+        assert doc.startswith(f"[Date: {self.OLD.strftime('%B %d, %Y')} ({self.OLD.strftime('%Y-%m-%d')})]")
+
+    async def test_date_prefix_mentioned_at_anchor_dates_observations_fresh(self):
+        """mentioned_at anchor: the cross-encoder sees the freshest support date."""
+        reranker, candidate = self._make_reranker_and_candidate(
+            "observation", occurred_start=self.OLD, mentioned_at=self.FRESH
+        )
+        await reranker.rerank("query", [candidate], observation_recency_anchor="mentioned_at")
+        doc = self._document_sent_to_cross_encoder(reranker)
+        assert doc.startswith(f"[Date: {self.FRESH.strftime('%B %d, %Y')} ({self.FRESH.strftime('%Y-%m-%d')})]")
+
+    async def test_date_prefix_mentioned_at_anchor_leaves_non_observations_unchanged(self):
+        """Non-observations keep the occurred_start-only prefix in every mode."""
+        reranker, candidate = self._make_reranker_and_candidate(
+            "world", occurred_start=self.OLD, mentioned_at=self.FRESH
+        )
+        await reranker.rerank("query", [candidate], observation_recency_anchor="mentioned_at")
+        doc = self._document_sent_to_cross_encoder(reranker)
+        assert doc.startswith(f"[Date: {self.OLD.strftime('%B %d, %Y')} ({self.OLD.strftime('%Y-%m-%d')})]")
+
+    async def test_date_prefix_non_observation_without_occurred_start_stays_unprefixed(self):
+        """A mentioned_at-only world fact never gains a date prefix (historical shape)."""
+        reranker, candidate = self._make_reranker_and_candidate("world", mentioned_at=self.FRESH)
+        await reranker.rerank("query", [candidate], observation_recency_anchor="mentioned_at")
+        doc = self._document_sent_to_cross_encoder(reranker)
+        assert not doc.startswith("[Date:")
