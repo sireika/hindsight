@@ -27,6 +27,8 @@ def setup_test_env():
         "HINDSIGHT_API_LLM_BEDROCK_SERVICE_TIER",
         "HINDSIGHT_API_LLM_GEMINI_SERVICE_TIER",
         "HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY",
+        "HINDSIGHT_API_CONSOLIDATION_DEBOUNCE_SECONDS",
+        "HINDSIGHT_API_CONSOLIDATION_DEBOUNCE_MAX_DELAY_SECONDS",
         "HINDSIGHT_API_DATABASE_URL",
         "HINDSIGHT_API_MIGRATION_DATABASE_URL",
     ]
@@ -174,6 +176,59 @@ def test_semantic_min_similarity_must_be_between_zero_and_one():
 
     with pytest.raises(ValueError, match="semantic_min_similarity"):
         HindsightConfig.from_env()
+
+
+def test_consolidation_debounce_defaults_to_disabled():
+    """The debounce is off by default (0), preserving immediate scheduling."""
+    from hindsight_api.config import HindsightConfig
+
+    config = HindsightConfig.from_env()
+    assert config.consolidation_debounce_seconds == 0
+    assert config.consolidation_debounce_max_delay_seconds == 1800
+
+
+def test_consolidation_debounce_reads_from_env():
+    """Both debounce knobs are configurable at the server level."""
+    from hindsight_api.config import HindsightConfig
+
+    os.environ["HINDSIGHT_API_CONSOLIDATION_DEBOUNCE_SECONDS"] = "300"
+    os.environ["HINDSIGHT_API_CONSOLIDATION_DEBOUNCE_MAX_DELAY_SECONDS"] = "900"
+
+    config = HindsightConfig.from_env()
+    assert config.consolidation_debounce_seconds == 300
+    assert config.consolidation_debounce_max_delay_seconds == 900
+
+
+def test_consolidation_debounce_must_not_be_negative():
+    """A negative debounce window fails fast during configuration loading."""
+    from hindsight_api.config import HindsightConfig
+
+    os.environ["HINDSIGHT_API_CONSOLIDATION_DEBOUNCE_SECONDS"] = "-5"
+
+    with pytest.raises(ValueError, match="HINDSIGHT_API_CONSOLIDATION_DEBOUNCE_SECONDS"):
+        HindsightConfig.from_env()
+
+
+def test_consolidation_debounce_max_delay_must_cover_the_window():
+    """max delay is the starvation bound — it can't be shorter than the window."""
+    from hindsight_api.config import HindsightConfig
+
+    os.environ["HINDSIGHT_API_CONSOLIDATION_DEBOUNCE_SECONDS"] = "300"
+    os.environ["HINDSIGHT_API_CONSOLIDATION_DEBOUNCE_MAX_DELAY_SECONDS"] = "100"
+
+    with pytest.raises(ValueError, match="HINDSIGHT_API_CONSOLIDATION_DEBOUNCE_MAX_DELAY_SECONDS"):
+        HindsightConfig.from_env()
+
+
+def test_consolidation_debounce_max_delay_ignored_when_disabled():
+    """With the window off (0), the max delay is not validated against it."""
+    from hindsight_api.config import HindsightConfig
+
+    os.environ["HINDSIGHT_API_CONSOLIDATION_DEBOUNCE_SECONDS"] = "0"
+    os.environ["HINDSIGHT_API_CONSOLIDATION_DEBOUNCE_MAX_DELAY_SECONDS"] = "100"
+
+    config = HindsightConfig.from_env()
+    assert config.consolidation_debounce_seconds == 0
 
 
 def test_consolidation_max_completion_tokens_defaults_to_unset():

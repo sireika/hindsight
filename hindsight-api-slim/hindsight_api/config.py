@@ -670,6 +670,20 @@ ENV_LLM_TRACE_MAX_CHARS = "HINDSIGHT_API_LLM_TRACE_MAX_CHARS"
 # Background maintenance settings
 ENV_CONSOLIDATION_RECONCILE_INTERVAL_SECONDS = "HINDSIGHT_API_CONSOLIDATION_RECONCILE_INTERVAL_SECONDS"
 ENV_MENTAL_MODEL_REFRESH_TICK_SECONDS = "HINDSIGHT_API_MENTAL_MODEL_REFRESH_TICK_SECONDS"
+# Debounce for retain-auto consolidation scheduling. Every fact insert (retain
+# or document import) submits a consolidation op, and an idle worker claims it
+# within one poll interval — so a chatty session pays roughly one full
+# consolidation job per retain call. With a debounce > 0, retain-triggered
+# consolidations become claimable only after the window elapses, and each
+# further retain inside the window slides the deadline (bounded by the max
+# delay below), so a burst of retains coalesces into one consolidation per
+# quiet window. 0 (default) preserves the immediate per-retain scheduling.
+# Manual /consolidate, the periodic reconcile sweep, and mutation-triggered
+# consolidations are never debounced.
+ENV_CONSOLIDATION_DEBOUNCE_SECONDS = "HINDSIGHT_API_CONSOLIDATION_DEBOUNCE_SECONDS"
+# Starvation bound for the debounce: a debounced consolidation never slides
+# past created_at + this many seconds, no matter how many retains keep coming.
+ENV_CONSOLIDATION_DEBOUNCE_MAX_DELAY_SECONDS = "HINDSIGHT_API_CONSOLIDATION_DEBOUNCE_MAX_DELAY_SECONDS"
 
 # Disposition settings
 ENV_DISPOSITION_SKEPTICISM = "HINDSIGHT_API_DISPOSITION_SKEPTICISM"
@@ -1110,6 +1124,14 @@ DEFAULT_CONSOLIDATION_RECONCILE_INTERVAL_SECONDS = 300
 # due for a refresh. This is the *check* cadence; the actual schedule is the
 # per-model cron expression in the mental model's trigger. 0 disables the sweep.
 DEFAULT_MENTAL_MODEL_REFRESH_TICK_SECONDS = 60
+
+# Debounce window for retain-auto consolidation scheduling (see
+# ENV_CONSOLIDATION_DEBOUNCE_SECONDS). 0 disables the debounce: every retain
+# schedules an immediately-claimable consolidation, today's behaviour.
+DEFAULT_CONSOLIDATION_DEBOUNCE_SECONDS = 0
+# Starvation bound for the debounce slide: a debounced consolidation never
+# moves past created_at + this many seconds.
+DEFAULT_CONSOLIDATION_DEBOUNCE_MAX_DELAY_SECONDS = 1800
 
 # Default MCP tool descriptions (can be customized via env vars)
 DEFAULT_MCP_RETAIN_DESCRIPTION = """Store important information to long-term memory.
@@ -1942,6 +1964,13 @@ class HindsightConfig:
     # How often the maintenance loop checks for cron-scheduled mental models due for
     # refresh (the per-model schedule lives in the mental model trigger). 0 = disabled.
     mental_model_refresh_tick_seconds: int
+    # Debounce window (seconds) for retain-auto consolidation scheduling: a
+    # retain-triggered consolidation becomes claimable only after this window,
+    # and further retains slide the deadline. 0 = disabled (immediate).
+    consolidation_debounce_seconds: int
+    # Starvation bound for the debounce slide: a debounced consolidation never
+    # moves past created_at + this many seconds.
+    consolidation_debounce_max_delay_seconds: int
 
     # Webhook configuration (static - server-level only, not per-bank)
     webhook_url: str | None  # Global webhook URL (None = disabled)
@@ -2218,6 +2247,22 @@ class HindsightConfig:
             retain_max_completion_tokens_name="HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS",
             retain_chunk_size_name="HINDSIGHT_API_RETAIN_CHUNK_SIZE",
         )
+
+        if self.consolidation_debounce_seconds < 0:
+            raise ValueError(
+                f"Invalid HINDSIGHT_API_CONSOLIDATION_DEBOUNCE_SECONDS: "
+                f"{self.consolidation_debounce_seconds}. Must be >= 0 (0 disables the debounce)."
+            )
+        if (
+            self.consolidation_debounce_seconds > 0
+            and self.consolidation_debounce_max_delay_seconds < self.consolidation_debounce_seconds
+        ):
+            raise ValueError(
+                f"Invalid HINDSIGHT_API_CONSOLIDATION_DEBOUNCE_MAX_DELAY_SECONDS: "
+                f"{self.consolidation_debounce_max_delay_seconds}. Must be >= "
+                f"HINDSIGHT_API_CONSOLIDATION_DEBOUNCE_SECONDS ({self.consolidation_debounce_seconds}) — "
+                f"the max delay is the starvation bound on how far the debounce may slide."
+            )
 
         # Warn if local ML dependencies are missing when configured.
         # Don't hard-fail here — the actual ImportError fires at model init time
@@ -3009,6 +3054,18 @@ class HindsightConfig:
                 os.getenv(
                     ENV_MENTAL_MODEL_REFRESH_TICK_SECONDS,
                     str(DEFAULT_MENTAL_MODEL_REFRESH_TICK_SECONDS),
+                )
+            ),
+            consolidation_debounce_seconds=int(
+                os.getenv(
+                    ENV_CONSOLIDATION_DEBOUNCE_SECONDS,
+                    str(DEFAULT_CONSOLIDATION_DEBOUNCE_SECONDS),
+                )
+            ),
+            consolidation_debounce_max_delay_seconds=int(
+                os.getenv(
+                    ENV_CONSOLIDATION_DEBOUNCE_MAX_DELAY_SECONDS,
+                    str(DEFAULT_CONSOLIDATION_DEBOUNCE_MAX_DELAY_SECONDS),
                 )
             ),
             # Webhook configuration (static, server-level only)

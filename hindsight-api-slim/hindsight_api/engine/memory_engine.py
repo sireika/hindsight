@@ -3649,7 +3649,12 @@ class MemoryEngine(MemoryEngineInterface):
             config = await self._config_resolver.resolve_full_config(bank_id, request_context)
         if config.enable_observations and config.enable_auto_consolidation:
             try:
-                await self.submit_async_consolidation(bank_id=bank_id, request_context=request_context)
+                # debounce=True marks this as a retain-auto submission: it is the
+                # only origin eligible for the consolidation debounce
+                # (HINDSIGHT_API_CONSOLIDATION_DEBOUNCE_SECONDS). Manual
+                # /consolidate, the reconcile sweep, and mutation-triggered
+                # submissions stay immediate.
+                await self.submit_async_consolidation(bank_id=bank_id, request_context=request_context, debounce=True)
             except Exception as e:
                 logger.warning(f"Failed to submit consolidation task for bank {bank_id}: {e}")
         try:
@@ -12235,6 +12240,7 @@ class MemoryEngine(MemoryEngineInterface):
         *,
         result_metadata: dict[str, Any] | None = None,
         dedupe_by_bank: bool = False,
+        debounce: bool = False,
     ) -> dict[str, Any]:
         """Generic helper to submit an async operation.
 
@@ -12245,6 +12251,13 @@ class MemoryEngine(MemoryEngineInterface):
             task_payload: Additional task payload fields (operation_id and bank_id are added automatically)
             result_metadata: Optional metadata to store with the operation record
             dedupe_by_bank: If True, skip creating a new task if one is already pending for this bank+operation_type
+            debounce: If True and the configured consolidation debounce window is
+                > 0, the operation is inserted with ``next_retry_at`` in the
+                future (so no worker claims it before the window elapses) and a
+                ``task_payload.debounce`` marker; a dedupe hit against a pending
+                marked operation slides its deadline instead (capped at
+                ``created_at + max delay``). Only retain-auto consolidation
+                submissions pass True.
 
         Returns:
             Dict with operation_id and optionally deduplicated=True if an existing task was found
@@ -12254,6 +12267,18 @@ class MemoryEngine(MemoryEngineInterface):
         backend = await self._get_backend()
 
         operation_id = uuid.uuid4()
+
+        # Resolve the debounce window (static server config). The window and the
+        # payload marker must be decided BEFORE the INSERT: setting next_retry_at
+        # with a follow-up UPDATE would race the worker poller, which can claim a
+        # freshly inserted row within one poll interval.
+        debounce_seconds = 0.0
+        debounce_max_delay_seconds = 0.0
+        if debounce:
+            debounce_config = get_config()
+            debounce_seconds = float(debounce_config.consolidation_debounce_seconds)
+            debounce_max_delay_seconds = float(debounce_config.consolidation_debounce_max_delay_seconds)
+        debounce_active = debounce and debounce_seconds > 0
 
         # Build full payload before INSERT so task_payload is included atomically.
         # Previously the INSERT omitted task_payload and a separate submit_task call
@@ -12265,6 +12290,21 @@ class MemoryEngine(MemoryEngineInterface):
             "bank_id": bank_id,
             **task_payload,
         }
+
+        next_retry_at: datetime | None = None
+        if debounce_active:
+            debounce_now = datetime.now(UTC)
+            next_retry_at = debounce_now + timedelta(seconds=debounce_seconds)
+            # The marker distinguishes a debounced operation from one whose
+            # next_retry_at was set by retry backoff or DeferOperation
+            # backpressure — only marked operations may ever be slid by a later
+            # debounced submit, and operators can tell "debounced" apart from
+            # "retry-blocked/deferred" in operation listings.
+            full_payload["debounce"] = {
+                "v": 1,
+                "until": next_retry_at.isoformat(),
+                "created": debounce_now.isoformat(),
+            }
 
         from hindsight_api.extensions.operation_validator import OperationValidationError
 
@@ -12308,7 +12348,7 @@ class MemoryEngine(MemoryEngineInterface):
                     # a fresh run regardless.
                     pending = await conn.fetch(
                         f"""
-                        SELECT operation_id, task_payload FROM {fq_table("async_operations")}
+                        SELECT operation_id, task_payload, created_at FROM {fq_table("async_operations")}
                         WHERE bank_id = $1 AND operation_type = $2 AND status = 'pending'
                         """,
                         bank_id,
@@ -12324,6 +12364,18 @@ class MemoryEngine(MemoryEngineInterface):
                         row_payload = row["task_payload"]
                         row_dict = json.loads(row_payload) if isinstance(row_payload, str) else (row_payload or {})
                         if row_dict.get("observation_scopes") is None:
+                            if debounce_active:
+                                # A debounced submit that hits a pending debounced
+                                # op slides its deadline instead of creating a new
+                                # row. Serialized per bank by the FOR NO KEY UPDATE
+                                # lock above.
+                                await self._slide_debounced_operation(
+                                    conn,
+                                    row,
+                                    row_dict,
+                                    debounce_seconds=debounce_seconds,
+                                    max_delay_seconds=debounce_max_delay_seconds,
+                                )
                             logger.debug(
                                 f"{operation_type} task already pending for bank_id={bank_id}, "
                                 f"skipping duplicate (existing operation_id={row['operation_id']})"
@@ -12343,10 +12395,14 @@ class MemoryEngine(MemoryEngineInterface):
                     if bank_exists is None:
                         raise OperationValidationError(f"Bank '{bank_id}' not found", status_code=404)
 
+                # next_retry_at is carried by the INSERT itself (NULL unless
+                # debounced) so the row is atomically unclaimable for the debounce
+                # window — worker claim queries filter
+                # ``next_retry_at IS NULL OR next_retry_at <= NOW()``.
                 await conn.execute(
                     f"""
-                    INSERT INTO {fq_table("async_operations")} (operation_id, bank_id, operation_type, result_metadata, status, task_payload)
-                    VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                    INSERT INTO {fq_table("async_operations")} (operation_id, bank_id, operation_type, result_metadata, status, task_payload, next_retry_at)
+                    VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
                     """,
                     operation_id,
                     bank_id,
@@ -12354,9 +12410,13 @@ class MemoryEngine(MemoryEngineInterface):
                     json.dumps(result_metadata or {}, default=_json_default),
                     "pending",
                     json.dumps(full_payload, default=_json_default),
+                    next_retry_at,
                 )
 
-        # For SyncTaskBackend: executes the task immediately.
+        # For SyncTaskBackend: executes the task immediately. This makes the
+        # debounce a no-op under the sync backend (tests/embedded/CLI) — the
+        # operation runs inline regardless of next_retry_at, which is the
+        # pre-debounce behavior, never starvation.
         # For BrokerTaskBackend: no-op (submit_task's UPDATE skips rows whose
         # task_payload is already set, which it is after the INSERT above). The call
         # is kept for symmetry and to support any future notification mechanisms.
@@ -12367,6 +12427,58 @@ class MemoryEngine(MemoryEngineInterface):
         return {
             "operation_id": str(operation_id),
         }
+
+    @staticmethod
+    async def _slide_debounced_operation(
+        conn: Any,
+        row: Any,
+        row_payload: dict[str, Any],
+        *,
+        debounce_seconds: float,
+        max_delay_seconds: float,
+    ) -> None:
+        """Slide a pending debounced operation's claim-eligibility forward.
+
+        Runs on the dedupe-hit path of ``_submit_async_operation``, which is
+        already serialized per bank by the FOR NO KEY UPDATE bank-row lock, so
+        two submits can't slide the same row concurrently. The new deadline is
+        ``now + debounce_seconds`` capped at ``created_at + max_delay_seconds``
+        (the starvation bound: a bank that never goes quiet still consolidates).
+
+        Only operations carrying the ``task_payload.debounce`` marker are ever
+        touched. ``next_retry_at`` is also an operator-visible
+        retry/backpressure field — retry backoff and DeferOperation set it on
+        unmarked operations without bumping ``retry_count`` — so an unmarked
+        pending operation must never be moved by the debounce.
+        """
+        import json
+
+        marker = row_payload.get("debounce")
+        if not (isinstance(marker, dict) and marker.get("v") == 1):
+            return
+        created_at = row["created_at"]
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=UTC)
+        now = datetime.now(UTC)
+        until = min(
+            now + timedelta(seconds=debounce_seconds),
+            created_at + timedelta(seconds=max_delay_seconds),
+        )
+        # Keep the marker's diagnostic ``until`` in sync with the column.
+        updated_payload = {**row_payload, "debounce": {**marker, "until": until.isoformat()}}
+        # Single statement, re-guarded on status: if a worker claimed the
+        # operation between the pending SELECT and here, the row is left alone
+        # (a claimed operation must not have its schedule or payload rewritten).
+        await conn.execute(
+            f"""
+            UPDATE {fq_table("async_operations")}
+            SET next_retry_at = $2, task_payload = $3::jsonb
+            WHERE operation_id = $1 AND status = 'pending'
+            """,
+            row["operation_id"],
+            until,
+            json.dumps(updated_payload, default=_json_default),
+        )
 
     async def submit_async_retain(
         self,
@@ -12678,6 +12790,7 @@ class MemoryEngine(MemoryEngineInterface):
         *,
         request_context: "RequestContext",
         observation_scopes: list[list[str]] | None = None,
+        debounce: bool = False,
     ) -> dict[str, Any]:
         """Submit a consolidation operation to run asynchronously.
 
@@ -12689,6 +12802,12 @@ class MemoryEngine(MemoryEngineInterface):
             request_context: Request context for authentication
             observation_scopes: Optional list of tag scopes to consolidate. When provided,
                 only unconsolidated memories matching at least one scope are processed.
+            debounce: Mark this as a retain-auto submission eligible for the
+                consolidation debounce (HINDSIGHT_API_CONSOLIDATION_DEBOUNCE_SECONDS).
+                Only the post-insert maintenance path passes True; manual
+                /consolidate, the reconcile sweep, and mutation-triggered
+                submissions stay immediate. No-op when the configured debounce
+                is 0 or the submission is scoped.
 
         Returns:
             Dict with operation_id
@@ -12725,6 +12844,9 @@ class MemoryEngine(MemoryEngineInterface):
             task_type="consolidation",
             task_payload=task_payload,
             dedupe_by_bank=dedupe,
+            # Scoped runs are targeted and never debounced (they also skip the
+            # dedupe path the debounce slide rides on).
+            debounce=debounce and dedupe,
         )
 
     async def submit_async_graph_maintenance(
